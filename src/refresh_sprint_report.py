@@ -243,10 +243,11 @@ def build_project_table(delivered, finished, in_prog, open_i):
             p["nt"] if p["nt"] > 0 else "-",
         ])
 
-    # Total row: Tickets = non-security grand total, Security = security grand
-    # total. Kept numeric so Tickets + Security reconciles to the JIRA Total.
-    grand_tickets = grand_total - grand_sec
-    total_row = ["Total", grand_tickets, grand_sec, "", "", "", ""]
+    # Total row: a single combined figure (Tickets + Security = full grand
+    # total = JIRA Total) shown in one merged cell spanning the Tickets and
+    # Security columns. We put the combined total in the Tickets cell and leave
+    # Security blank; overwrite_project_table merges the two cells after writing.
+    total_row = ["Total", grand_total, "", "", "", "", ""]
     return rows, total_row
 
 
@@ -330,16 +331,24 @@ def append_status_column(svc, status_metrics, date_label):
     target_col = last_filled + 2                    # 1-based col after last content
     letter = col_letter(target_col)
 
-    # Widen the grid only if we genuinely need a column that doesn't exist yet.
+    # Widen the grid if we need a column that doesn't exist yet. Your sheet is
+    # full to its last column, so each new week's column requires growing the
+    # grid by one. We set columnCount explicitly (never shrinking) — this is more
+    # reliable than appendDimension and the log line makes the resize visible.
     sheet_id, col_count, _row_count = _sheet_meta(svc, STATUS_TAB)
     if target_col > col_count:
+        new_count = target_col + 1  # +1 headroom so we're not always at the edge
+        print(f"  Widening '{STATUS_TAB}' grid: {col_count} -> {new_count} columns "
+              f"(need column {letter}={target_col})", flush=True)
         svc.spreadsheets().batchUpdate(
             spreadsheetId=GOOGLE_SHEET_ID,
             body={"requests": [{
-                "appendDimension": {
-                    "sheetId": sheet_id,
-                    "dimension": "COLUMNS",
-                    "length": target_col - col_count,
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"columnCount": new_count},
+                    },
+                    "fields": "gridProperties.columnCount",
                 }
             }]},
         ).execute()
@@ -445,18 +454,45 @@ def overwrite_project_table(svc, rows, total_row):
     end_row = 1 + len(body_rows)
 
     # Grow the grid (rows) if this week needs more than the sheet currently has.
-    sheet_id, _cols, row_count = _sheet_meta_rows(svc, PROJECT_TAB)
+    sheet_id, col_count, row_count = _sheet_meta_rows(svc, PROJECT_TAB)
     if end_row > row_count:
+        new_rows = end_row + 1  # +1 headroom
+        print(f"  Growing '{PROJECT_TAB}' grid: {row_count} -> {new_rows} rows "
+              f"(need {len(body_rows)} data rows)", flush=True)
         svc.spreadsheets().batchUpdate(
             spreadsheetId=GOOGLE_SHEET_ID,
             body={"requests": [{
-                "appendDimension": {
-                    "sheetId": sheet_id,
-                    "dimension": "ROWS",
-                    "length": end_row - row_count,
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"rowCount": new_rows},
+                    },
+                    "fields": "gridProperties.rowCount",
                 }
             }]},
         ).execute()
+        row_count = new_rows
+
+    # Unmerge any merged cells sitting in the data region before writing. The
+    # sheet historically had a merged/greyed Total row baked in at a fixed row;
+    # when the table grows past last week's length, project rows can land on
+    # that leftover merge and collide (values dropped into a merged cell). This
+    # clears any merge across the whole data area each run so it can't recur.
+    # (Cell FILL/shading is left alone — visual styling stays owned by the sheet.)
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        body={"requests": [{
+            "unmergeCells": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,            # row 2 (0-based, exclusive of header)
+                    "endRowIndex": row_count,      # to bottom of grid
+                    "startColumnIndex": 0,
+                    "endColumnIndex": col_count,   # full width
+                }
+            }
+        }]},
+    ).execute()
 
     # Clear old data values across the owned span (row 2 down). Clearing values
     # leaves the spacer column's fill/formatting intact.
@@ -478,6 +514,32 @@ def overwrite_project_table(svc, rows, total_row):
     svc.spreadsheets().values().batchUpdate(
         spreadsheetId=GOOGLE_SHEET_ID,
         body={"valueInputOption": "USER_ENTERED", "data": data},
+    ).execute()
+
+    # Merge the Total row's Tickets + Security cells into one, so the combined
+    # grand total (which equals the JIRA Total) shows as a single figure —
+    # restoring the merged Total cell the sheet originally had. The combined
+    # value was written into the Tickets cell; MERGE_ALL keeps that top-left
+    # value. Tickets and Security are adjacent, so this spans exactly the two.
+    tickets_ci = col_idx["Tickets"]
+    security_ci = col_idx["Security"]
+    merge_start = min(tickets_ci, security_ci)
+    merge_end = max(tickets_ci, security_ci) + 1    # half-open, 0-based
+    total_row_idx0 = end_row - 1                     # 0-based index of the Total row
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        body={"requests": [{
+            "mergeCells": {
+                "mergeType": "MERGE_ALL",
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": total_row_idx0,
+                    "endRowIndex": total_row_idx0 + 1,
+                    "startColumnIndex": merge_start,
+                    "endColumnIndex": merge_end,
+                },
+            }
+        }]},
     ).execute()
 
 
@@ -503,20 +565,18 @@ def main():
     proj_rows, total_row = build_project_table(delivered, finished, in_prog, open_i)
     status_map = dict(status_metrics)
     jira_total = status_map["JIRA Total"]
-    # total_row is ["Total", tickets_excl_security, security, ...]; the full
-    # grand total is Tickets + Security and must match the JIRA Total.
-    project_grand_total = total_row[1] + total_row[2]
+    # total_row is ["Total", combined_grand_total, "", ...]; the combined figure
+    # (non-security + security) must match the JIRA Total on the status tab.
+    project_grand_total = total_row[1]
     print(f"  JIRA Total:  {jira_total}")
     print(f"  Missing component (Open): {status_map['Missing Component']}")
-    print(f"  Projects:    {len(proj_rows)} rows, "
-          f"grand total {project_grand_total} (tickets {total_row[1]} + security {total_row[2]})")
+    print(f"  Projects:    {len(proj_rows)} rows, grand total {project_grand_total}")
 
     if jira_total != project_grand_total:
         print(
             f"WARNING: JIRA Total ({jira_total}) != project grand total "
-            f"({project_grand_total} = tickets {total_row[1]} + security {total_row[2]}). "
-            f"With no-parent tickets bucketed under 'Missing parent', these should "
-            f"match — investigate if they don't.",
+            f"({project_grand_total}). With no-parent tickets bucketed under "
+            f"'Missing parent', these should match — investigate if they don't.",
             file=sys.stderr,
         )
 
